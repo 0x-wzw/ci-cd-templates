@@ -1,8 +1,5 @@
 name: 🐍 Python Standard CI (uv)
 
-# USAGE: For Python repos using uv (modern pip replacement).
-# Based on hermes-agent pattern.
-
 on:
   workflow_call:
     inputs:
@@ -31,11 +28,6 @@ on:
         description: 'Token for Docker registry login'
         required: false
 
-env:
-  PYTHON_VERSION: ${{ inputs.python-version }}
-  REGISTRY: ${{ inputs.docker-registry }}
-  IMAGE_NAME: ${{ github.repository }}
-
 jobs:
   lint:
     name: Lint & Format
@@ -44,9 +36,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
-      - run: uv python install ${{ env.PYTHON_VERSION }}
+      - run: uv python install ${{ inputs.python-version }}
       - run: |
-          uv venv .venv --python ${{ env.PYTHON_VERSION }}
+          uv venv .venv --python ${{ inputs.python-version }}
           source .venv/bin/activate
           uv pip install -e ".[dev]"
       - run: |
@@ -61,9 +53,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
-      - run: uv python install ${{ env.PYTHON_VERSION }}
+      - run: uv python install ${{ inputs.python-version }}
       - run: |
-          uv venv .venv --python ${{ env.PYTHON_VERSION }}
+          uv venv .venv --python ${{ inputs.python-version }}
           source .venv/bin/activate
           uv pip install -e ".[all,dev]"
       - run: |
@@ -80,9 +72,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
-      - run: uv python install ${{ env.PYTHON_VERSION }}
+      - run: uv python install ${{ inputs.python-version }}
       - run: |
-          uv venv .venv --python ${{ env.PYTHON_VERSION }}
+          uv venv .venv --python ${{ inputs.python-version }}
           source .venv/bin/activate
           uv pip install -e ".[all,dev]"
       - run: |
@@ -120,7 +112,7 @@ jobs:
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
+          registry: ${{ inputs.docker-registry }}
           username: ${{ github.actor }}
           password: ${{ secrets.registry-token || secrets.GITHUB_TOKEN }}
       - uses: docker/build-push-action@v6
@@ -130,5 +122,5 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ inputs.docker-registry }}/${{ github.repository }}:latest
+            ${{ inputs.docker-registry }}/${{ github.repository }}:${{ github.sha }}
