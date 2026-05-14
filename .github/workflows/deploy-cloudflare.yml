@@ -1,0 +1,60 @@
+name: Deploy to Cloudflare Pages
+
+# USAGE: Replace intelligence-site's broken deploy.yml with this.
+# Also use for any static site deployed to Cloudflare.
+
+on:
+  workflow_call:
+    inputs:
+      build-command:
+        description: 'Command to build the site'
+        required: false
+        default: 'npm run build'
+        type: string
+      build-directory:
+        description: 'Directory containing built files'
+        required: false
+        default: 'dist'
+        type: string
+      node-version:
+        description: 'Node.js version for build'
+        required: false
+        default: '20'
+        type: string
+    secrets:
+      cloudflare-api-token:
+        description: 'Cloudflare API token'
+        required: true
+      cloudflare-account-id:
+        description: 'Cloudflare account ID'
+        required: true
+
+permissions:
+  contents: read
+  deployments: write
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build site
+        run: ${{ inputs.build-command }}
+
+      - name: Deploy to Cloudflare Pages
+        uses: cloudflare/pages-action@v1
+        with:
+          apiToken: ${{ secrets.cloudflare-api-token }}
+          accountId: ${{ secrets.cloudflare-account-id }}
+          projectName: ${{ github.event.repository.name }}
+          directory: ${{ inputs.build-directory }}
+          gitHubToken: ${{ secrets.GITHUB_TOKEN }}
