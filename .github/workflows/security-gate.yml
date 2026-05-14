@@ -1,0 +1,149 @@
+name: 🔒 PR Security Gate
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: 'Node.js version for package validation'
+        required: false
+        default: '20'
+        type: string
+      fail-on-source-maps:
+        description: 'Block PR if source maps are detected'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  detect-source-maps:
+    name: 🗺️ Detect Source Maps
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 🔍 Check for source map files
+        id: detect
+        run: |
+          echo "::group::🔍 Checking for source map files in PR"
+
+          BASE="origin/${{ github.base_ref }}"
+          HEAD="HEAD"
+
+          # Get list of changed files
+          MAP_FILES=$(git diff --name-only "$BASE...$HEAD" | grep -E '\.(map|js\.map|ts\.map|css\.map)$' || true)
+
+          if [[ -n "$MAP_FILES" ]]; then
+            echo "::error::❌ Source map files detected in PR!"
+            echo "These should not be committed to the repository:"
+            echo "$MAP_FILES" | while read -r file; do
+              echo "  - $file"
+            done
+
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            exit 1
+          else
+            echo "✅ No source map files in PR"
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "::endgroup::"
+
+      - name: 📝 Comment on PR
+        if: failure() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## 🚫 Security Gate Failed\n\n**Source map files detected in this PR.**\n\nSource maps (\`.map\` files) should not be committed to the repository as they can expose source code when accidentally published to npm.\n\n**Action required:**\n1. Remove source map files: \`git rm *.map\`\n2. Add to \`.gitignore\`: \`echo "*.map" >> .gitignore\`\n3. Commit and push changes`
+            });
+
+  check-npmignore:
+    name: 📝 Check .npmignore
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 🔍 Validate .npmignore
+        run: |
+          echo "::group::🔍 Checking .npmignore configuration"
+
+          ISSUES_FOUND=0
+
+          while IFS= read -r -d '' pkg_file; do
+            pkg_dir=$(dirname "$pkg_file")
+
+            if git diff --name-only origin/${{ github.base_ref }}...HEAD | grep -q "$(realpath --relative-to=. "$pkg_file")"; then
+              echo "Checking: $pkg_dir"
+
+              if [[ ! -f "$pkg_dir/.npmignore" ]] && [[ ! -f "$pkg_dir/../.npmignore" ]]; then
+                if ! grep -q '"files"' "$pkg_file" 2>/dev/null; then
+                  echo "::warning::$pkg_dir has no .npmignore and no files array"
+                  ISSUES_FOUND=$((ISSUES_FOUND + 1))
+                fi
+              fi
+
+              if [[ -f "$pkg_dir/.npmignore" ]]; then
+                if ! grep -q '\.map' "$pkg_dir/.npmignore"; then
+                  echo "::error::$pkg_dir/.npmignore does not exclude source maps"
+                  ISSUES_FOUND=$((ISSUES_FOUND + 1))
+                fi
+              fi
+            fi
+          done < <(find . -name "package.json" -type f -not -path "*/node_modules/*" -print0)
+
+          echo "::endgroup::"
+
+          if [[ $ISSUES_FOUND -gt 0 ]]; then
+            exit 1
+          fi
+
+  security-summary:
+    name: 🛡️ Security Gate Summary
+    runs-on: ubuntu-latest
+    needs: [detect-source-maps, check-npmignore]
+    if: always()
+    steps:
+      - name: 📊 Post Summary
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const detectStatus = '${{ needs.detect-source-maps.result }}';
+            const npmignoreStatus = '${{ needs.check-npmignore.result }}';
+            const allPassed = detectStatus === 'success' && npmignoreStatus === 'success';
+            const summary = allPassed
+              ? `## ✅ Security Gate Passed\n\nAll security checks passed. This PR is safe to merge.`
+              : `## ❌ Security Gate Failed\n\n| Check | Status |\n|-------|--------|\n| Source Map Detection | ${detectStatus === 'success' ? '✅ Pass' : '❌ Fail'} |\n| .npmignore Check | ${npmignoreStatus === 'success' ? '✅ Pass' : '❌ Fail'} |\n\nPlease fix the issues above before merging.`;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: summary
+            });
+
+  block-if-failed:
+    name: 🚫 Block Merge on Failure
+    runs-on: ubuntu-latest
+    needs: [detect-source-maps, check-npmignore]
+    if: always()
+    steps:
+      - name: Check results
+        run: |
+          if [[ '${{ needs.detect-source-maps.result }}' != 'success' ]] || \
+             [[ '${{ needs.check-npmignore.result }}' != 'success' ]]; then
+            echo "::error::❌ Security gate failed. PR cannot be merged."
+            exit 1
+          fi
+          echo "✅ All security checks passed"
