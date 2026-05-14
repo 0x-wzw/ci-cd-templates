@@ -1,0 +1,241 @@
+name: 🔒 Supply Chain Security Scan
+
+# USAGE: Call from any repo's PR workflow to scan for supply chain attack patterns.
+# Based on hermes-agent's supply-chain-audit.yml — the most sophisticated security scan in your portfolio.
+
+on:
+  workflow_call:
+    inputs:
+      fail-on-critical:
+        description: 'Fail the check if critical patterns are detected'
+        required: false
+        default: true
+        type: boolean
+      post-pr-comment:
+        description: 'Post findings as PR comment'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  scan:
+    name: Scan for Supply Chain Risks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Scan diff for suspicious patterns
+        id: scan
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
+
+          # Get the full diff (added lines only, exclude lock files)
+          DIFF=$(git diff "$BASE".."$HEAD" -- . ':!uv.lock' ':!*.lock' ':!package-lock.json' ':!yarn.lock' ':!pnpm-lock.yaml' || true)
+
+          FINDINGS=""
+          CRITICAL=false
+
+          # --- .pth files (auto-execute on Python startup) ---
+          PTH_FILES=$(git diff --name-only "$BASE".."$HEAD" | grep '\.pth$' || true)
+          if [ -n "$PTH_FILES" ]; then
+            CRITICAL=true
+            FINDINGS="${FINDINGS}
+          ### 🚨 CRITICAL: .pth file added or modified
+          Python \`.pth\` files in \`site-packages/\` execute automatically when the interpreter starts — no import required.
+          **Files:**
+          \`\`\`
+          ${PTH_FILES}
+          \`\`\`
+          "
+          fi
+
+          # --- base64 + exec/eval combo (litellm attack pattern) ---
+          B64_EXEC_HITS=$(echo "$DIFF" | grep -n '^\+' | grep -iE 'base64\.(b64decode|decodebytes|urlsafe_b64decode)' | grep -iE 'exec\(|eval\(' | head -10 || true)
+          if [ -n "$B64_EXEC_HITS" ]; then
+            CRITICAL=true
+            FINDINGS="${FINDINGS}
+          ### 🚨 CRITICAL: base64 decode + exec/eval combo
+          Exact pattern from the litellm supply chain attack — base64-decoded strings passed to exec/eval.
+          **Matches:**
+          \`\`\`
+          ${B64_EXEC_HITS}
+          \`\`\`
+          "
+          fi
+
+          # --- base64 decode/encode (alone — warning) ---
+          B64_HITS=$(echo "$DIFF" | grep -n '^\+' | grep -iE 'base64\.(b64decode|b64encode|decodebytes|encodebytes|urlsafe_b64decode)|atob\(|btoa\(|Buffer\.from\(.*base64' | head -20 || true)
+          if [ -n "$B64_HITS" ]; then
+            FINDINGS="${FINDINGS}
+          ### ⚠️ WARNING: base64 encoding/decoding detected
+          Verify the usage is appropriate (images, JWT, etc.).
+          **Matches (first 20):**
+          \`\`\`
+          ${B64_HITS}
+          \`\`\`
+          "
+          fi
+
+          # --- exec/eval with string arguments ---
+          EXEC_HITS=$(echo "$DIFF" | grep -n '^\+' | grep -E '(exec|eval)\s*\(' | grep -v '^\+\s*#' | grep -v 'test_\|mock\|assert\|# ' | head -20 || true)
+          if [ -n "$EXEC_HITS" ]; then
+            FINDINGS="${FINDINGS}
+          ### ⚠️ WARNING: exec() or eval() usage
+          Dynamic code execution can hide malicious behavior.
+          **Matches (first 20):**
+          \`\`\`
+          ${EXEC_HITS}
+          \`\`\`
+          "
+          fi
+
+          # --- subprocess with encoded/obfuscated commands ---
+          PROC_HITS=$(echo "$DIFF" | grep -n '^\+' | grep -E 'subprocess\.(Popen|call|run)\s*\(' | grep -iE 'base64|decode|encode|\\x|chr\(' | head -10 || true)
+          if [ -n "$PROC_HITS" ]; then
+            CRITICAL=true
+            FINDINGS="${FINDINGS}
+          ### 🚨 CRITICAL: subprocess with encoded/obfuscated command
+          **Matches:**
+          \`\`\`
+          ${PROC_HITS}
+          \`\`\`
+          "
+          fi
+
+          # --- Outbound network calls ---
+          EXFIL_HITS=$(echo "$DIFF" | grep -n '^\+' | grep -iE 'requests\.(post|put)\(|httpx\.(post|put)\(|urllib\.request\.urlopen' | grep -v '^\+\s*#' | grep -v 'test_\|mock\|assert' | head -10 || true)
+          if [ -n "$EXFIL_HITS" ]; then
+            FINDINGS="${FINDINGS}
+          ### ⚠️ WARNING: Outbound network calls (POST/PUT)
+          Verify destination URLs are legitimate.
+          **Matches (first 10):**
+          \`\`\`
+          ${EXFIL_HITS}
+          \`\`\`
+          "
+          fi
+
+          # --- Install hook files ---
+          SETUP_HITS=$(git diff --name-only "$BASE".."$HEAD" | grep -E '(setup\.py|setup\.cfg|__init__\.pth|sitecustomize\.py|usercustomize\.py)$' || true)
+          if [ -n "$SETUP_HITS" ]; then
+            FINDINGS="${FINDINGS}
+          ### ⚠️ WARNING: Install hook files modified
+          **Files:**
+          \`\`\`
+          ${SETUP_HITS}
+          \`\`\`
+          "
+          fi
+
+          # --- marshal/pickle/compile ---
+          MARSHAL_HITS=$(echo "$DIFF" | grep -n '^\+' | grep -iE 'marshal\.loads|pickle\.loads|compile\(' | grep -v '^\+\s*#' | grep -v 'test_\|re\.compile\|ast\.compile' | head -10 || true)
+          if [ -n "$MARSHAL_HITS" ]; then
+            FINDINGS="${FINDINGS}
+          ### ⚠️ WARNING: marshal/pickle/compile usage
+          **Matches:**
+          \`\`\`
+          ${MARSHAL_HITS}
+          \`\`\`
+          "
+          fi
+
+          # --- CI/CD workflow files modified ---
+          WORKFLOW_HITS=$(git diff --name-only "$BASE".."$HEAD" | grep -E '\.github/workflows/.*\.ya?ml$' || true)
+          if [ -n "$WORKFLOW_HITS" ]; then
+            FINDINGS="${FINDINGS}
+          ### ⚠️ WARNING: CI/CD workflow files modified
+          Verify no unauthorized actions or secrets access were added.
+          **Files:**
+          \`\`\`
+          ${WORKFLOW_HITS}
+          \`\`\`
+          "
+          fi
+
+          # --- Dockerfile / container build files ---
+          DOCKER_HITS=$(git diff --name-only "$BASE".."$HEAD" | grep -iE '(Dockerfile|\.dockerignore|docker-compose)' || true)
+          if [ -n "$DOCKER_HITS" ]; then
+            FINDINGS="${FINDINGS}
+          ### ⚠️ WARNING: Container build files modified
+          **Files:**
+          \`\`\`
+            ${DOCKER_HITS}
+            \`\`\`
+          "
+          fi
+
+          # --- Dependency manifest files ---
+          DEP_HITS=$(git diff --name-only "$BASE".."$HEAD" | grep -E '(pyproject\.toml|requirements.*\.txt|package\.json|Gemfile|go\.mod|Cargo\.toml)$' || true)
+          if [ -n "$DEP_HITS" ]; then
+            FINDINGS="${FINDINGS}
+          ### ⚠️ WARNING: Dependency manifest files modified
+          **Files:**
+          \`\`\`
+          ${DEP_HITS}
+          \`\`\`
+          "
+          fi
+
+          # --- GitHub Actions version unpinning ---
+          ACTIONS_UNPIN=$(echo "$DIFF" | grep -n '^\+' | grep 'uses:' | grep -v '#' | grep -E '@v[0-9]' | head -10 || true)
+          if [ -n "$ACTIONS_UNPIN" ]; then
+            FINDINGS="${FINDINGS}
+          ### ⚠️ WARNING: GitHub Actions with mutable version tags
+          Actions should be pinned to full commit SHAs (not \`@v4\`, \`@v5\`).
+          **Matches:**
+          \`\`\`
+          ${ACTIONS_UNPIN}
+          \`\`\`
+          "
+          fi
+
+          # Output results
+          if [ -n "$FINDINGS" ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            if [ "$CRITICAL" = true ]; then
+              echo "critical=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "critical=false" >> "$GITHUB_OUTPUT"
+            fi
+            echo "$FINDINGS" > /tmp/findings.md
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "critical=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Post warning comment
+        if: steps.scan.outputs.found == 'true' && inputs.post-pr-comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SEVERITY="⚠️ Supply Chain Risk Detected"
+          if [ "${{ steps.scan.outputs.critical }}" = "true" ]; then
+            SEVERITY="🚨 CRITICAL Supply Chain Risk Detected"
+          fi
+          BODY="## ${SEVERITY}
+
+          This PR contains patterns commonly associated with supply chain attacks. This does **not** mean the PR is malicious — but these patterns require careful human review before merging.
+
+          $(cat /tmp/findings.md)
+
+          ---
+          *Automated scan. If this is a false positive, a maintainer can approve after manual review.*"
+          gh pr comment "${{ github.event.pull_request.number }}" --body "$BODY" || echo "::warning::Could not post PR comment"
+
+      - name: Fail on critical findings
+        if: steps.scan.outputs.critical == 'true' && inputs.fail-on-critical
+        run: |
+          echo "::error::CRITICAL supply chain risk patterns detected. See PR comment for details."
+          exit 1
